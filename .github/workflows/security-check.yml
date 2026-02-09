@@ -1,0 +1,202 @@
+name: Security Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security checks every Monday at 9:00 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run npm audit (if package.json exists)
+        run: |
+          if [ -f "package.json" ]; then
+            npm audit --audit-level=moderate
+          else
+            echo "No package.json found, skipping npm audit"
+          fi
+        continue-on-error: true
+      
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'KEC-GUVI-Website'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --enableRetired
+            --enableExperimental
+        continue-on-error: true
+      
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  code-security-scan:
+    name: Code Security Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          queries: security-and-quality
+      
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  web-security-scan:
+    name: Web Security Headers Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Install security headers checker
+        run: npm install -g security-headers-check
+      
+      - name: Check HTML files for security best practices
+        run: |
+          echo "Checking HTML files for security issues..."
+          find . -name "*.html" -type f | while read file; do
+            echo "Checking $file"
+            # Check for inline scripts (potential XSS)
+            if grep -q "onclick\|onerror\|onload" "$file"; then
+              echo "⚠️  Warning: Inline event handlers found in $file"
+            fi
+            # Check for external script sources
+            if grep -q "src=\"http:" "$file"; then
+              echo "⚠️  Warning: Non-HTTPS script sources found in $file"
+            fi
+            # Check for meta CSP
+            if ! grep -q "Content-Security-Policy" "$file"; then
+              echo "ℹ️  Info: No CSP meta tag found in $file"
+            fi
+          done
+
+  lighthouse-security:
+    name: Lighthouse Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli
+      
+      - name: Start local server
+        run: |
+          python3 -m http.server 8080 &
+          sleep 3
+        working-directory: ./
+      
+      - name: Run Lighthouse
+        run: |
+          lhci autorun --collect.url=http://localhost:8080/index.html || true
+        continue-on-error: true
+
+  html-validation:
+    name: HTML Validation & Best Practices
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Validate HTML
+        uses: Cyb3r-Jak3/html5validator-action@v7.2.0
+        with:
+          root: ./
+          css: true
+          
+      - name: Check for common security issues
+        run: |
+          echo "Scanning for common security issues..."
+          
+          # Check for hardcoded credentials
+          if grep -r "password\s*=\s*['\"]" --include="*.html" --include="*.js" .; then
+            echo "⚠️  Warning: Potential hardcoded passwords found"
+          fi
+          
+          # Check for API keys
+          if grep -r "api[_-]key\s*=\s*['\"]" --include="*.html" --include="*.js" .; then
+            echo "⚠️  Warning: Potential hardcoded API keys found"
+          fi
+          
+          # Check for console.log (should be removed in production)
+          if grep -r "console\.log" --include="*.js" .; then
+            echo "ℹ️  Info: console.log statements found (consider removing for production)"
+          fi
+          
+          echo "Security scan complete!"
+
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs: [dependency-scan, code-security-scan, secret-scan, web-security-scan, html-validation]
+    if: always()
+    
+    steps:
+      - name: Security Check Summary
+        run: |
+          echo "# 🔒 Security Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Dependency Scan: ${{ needs.dependency-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Code Security Scan: ${{ needs.code-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Secret Detection: ${{ needs.secret-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Web Security Scan: ${{ needs.web-security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ HTML Validation: ${{ needs.html-validation.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
